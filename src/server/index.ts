@@ -544,22 +544,10 @@ export function startServer(options: ServerOptions): http.Server {
         return;
       }
 
-      // ── Prophecy Verse adapter routes ─────────────────────────────────
-      // These aliases reuse the existing metadata/provider/proxy pipeline.
-      // The generic routes below remain unchanged for backwards compatibility.
-      if (url.pathname === '/api/providers') {
-        return json(
-          res,
-          200,
-          providers.map((provider) => ({
-            id: provider.id,
-            name: (provider as BaseProvider & { name?: string }).name ?? provider.id,
-            supportedTypes: provider.supportedTypes,
-            supportsTracks: provider.supportsUnitTracks,
-          })),
-        );
-      }
-
+      // Prophecy adapter routes are handled exactly once by handleProphecyRoute
+      // above. In particular, /api/providers must use the canonical public
+      // Server alias format and must never fall through to a provider-name
+      // response here.
       if (url.pathname.startsWith('/api/anime/')) {
         const segments = url.pathname
           .slice('/api/anime/'.length)
@@ -1385,4 +1373,4 @@ function buildOpenApiSpec(args: {
     servers: [{ url: args.proxyBase.replace(/\/proxy$/, '') }],
     paths,
   };
-}
+        }
