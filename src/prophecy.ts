@@ -395,13 +395,16 @@ export async function resolveProphecyPlayback(
   request: ProphecyPlaybackRequest,
 ): Promise<ResolvedMediaStream> {
   const requestedAudio = request.audioLanguage ?? request.audio;
-  const selectedAudio = context.store.selectAudioLanguage(episode.episodeId, requestedAudio);
-  const selectedServer = request.server ? context.serverAliases?.find((server) => server.serverId === request.server && server.enabled) : undefined;
+  const configuredAudio = context.store.listAudioLanguages(episode.episodeId, true);
+  const selectedAudio = requestedAudio
+    ? context.store.selectAudioLanguage(episode.episodeId, requestedAudio)
+    : configuredAudio.find((item) => item.isDefault) ?? configuredAudio[0] ?? null;
+  const selectedServer = request.server ? internalServerOptions(context).find((server) => server.serverId === request.server && server.enabled) : undefined;
   if (request.server && !selectedServer) throw new ProphecyError(400, 'SERVER_UNAVAILABLE', 'Requested server is not available for this request');
-  const preferredSourceLanguage = requestedAudio ? selectedAudio.languageCode : request.language;
+  const preferredSourceLanguage = selectedAudio?.languageCode ?? request.language;
   const primaryCandidates = context.store.listSources(episode.episodeId, preferredSourceLanguage)
     .filter((source) => !selectedServer || source.providerId === selectedServer.providerId);
-  const fallbackCandidates = !requestedAudio && primaryCandidates.length === 0
+  const fallbackCandidates = !requestedAudio && selectedAudio && primaryCandidates.length === 0
     ? context.store.listSources(episode.episodeId, selectedAudio.languageCode)
       .filter((source) => !selectedServer || source.providerId === selectedServer.providerId)
     : [];
@@ -420,7 +423,7 @@ export async function resolveProphecyPlayback(
       context.store.setProvider(source.providerId, { health: 'degraded' });
     }
   }
-  throw new Error('No playable authorized source is available');
+  throw new ProphecyError(502, 'NO_PLAYABLE_SOURCE', 'No playable source is available for this episode');
 }
 
 export function authorizedMutation(req: IncomingMessage, api: ProphecyApi): boolean {
@@ -473,7 +476,8 @@ const PUBLIC_ANIME_PROVIDER_IDS = new Set(['gogoanime', 'goyabu', 'allmanga', 'a
 
 type PublicServerOption = Omit<ProphecyServerAlias, 'providerId'> & { available?: boolean };
 
-function publicServerOptions(context: ProphecyApiContext, episodeId?: string): PublicServerOption[] {
+function internalServerOptions(context: ProphecyApiContext): ProphecyServerAlias[] {
+  const providerStates = new Map(context.store.listProviders().map((item) => [item.providerId, item]));
   return (context.serverAliases ?? context.providers
     .filter((provider) => PUBLIC_ANIME_PROVIDER_IDS.has(provider.id))
     .map((provider, index) => ({
@@ -483,12 +487,21 @@ function publicServerOptions(context: ProphecyApiContext, episodeId?: string): P
       priority: index + 1,
       enabled: true,
     })))
-    .filter((server) => server.enabled)
-    .sort((a, b) => a.priority - b.priority)
-    .map(({ providerId, ...server }) => ({
-      ...server,
-      ...(episodeId ? { available: context.store.listSources(episodeId).some((source) => source.providerId === providerId && source.enabled) } : {}),
-    }));
+    .filter((server) => {
+      const provider = context.providers.find((item) => item.id === server.providerId);
+      const state = providerStates.get(server.providerId);
+      return Boolean(server.enabled && provider && state?.enabled !== false);
+    })
+    .sort((a, b) => a.priority - b.priority);
+}
+
+function publicServerOptions(context: ProphecyApiContext, episodeId?: string): PublicServerOption[] {
+  return internalServerOptions(context).map(({ providerId, ...server }) => ({
+    ...server,
+    ...(episodeId ? {
+      available: context.store.listSources(episodeId).some((source) => source.providerId === providerId && source.enabled),
+    } : {}),
+  }));
 }
 
 export async function handleProphecyRoute(
@@ -636,23 +649,32 @@ export async function handleProphecyRoute(
         if (parts.length === 4 && method === 'POST') { if (!admin()) return true; return ok(store.createSource(episodeId, await body() as Omit<ProphecySource, 'sourceId' | 'episodeId'>), 201), true; }
       }
       if (child === 'play' && method === 'GET') {
-        const selectedAudio = store.selectAudioLanguage(episodeId, url.searchParams.get('audioLanguage') ?? url.searchParams.get('audio') ?? undefined);
-        const selectedServer = url.searchParams.get('server') ?? undefined;
-        const stream = await resolveProphecyPlayback(context, episode, {
-          server: selectedServer,
-          language: (url.searchParams.get('language') as ContentLanguage | null) ?? undefined,
-          audioLanguage: url.searchParams.get('audioLanguage') ?? url.searchParams.get('audio') ?? undefined,
-          subtitle: url.searchParams.get('subtitle') ?? undefined,
-          quality: (url.searchParams.get('quality') as IVideoPayload['quality'] | null) ?? undefined,
-        });
-        return ok({
-          episodeId,
-          server: selectedServer ? publicServerOptions(context, episodeId).find((server) => server.serverId === selectedServer) ?? null : null,
-          availableServers: publicServerOptions(context, episodeId),
-          audioLanguage: selectedAudio,
-          availableAudioLanguages: store.listAudioLanguages(episodeId, true),
-          stream,
-        }), true;
+        try {
+          const requestedAudio = url.searchParams.get('audioLanguage') ?? url.searchParams.get('audio') ?? undefined;
+          const configuredAudio = store.listAudioLanguages(episodeId, true);
+          const selectedAudio = requestedAudio
+            ? store.selectAudioLanguage(episodeId, requestedAudio)
+            : configuredAudio.find((item) => item.isDefault) ?? configuredAudio[0] ?? null;
+          const selectedServer = url.searchParams.get('server') ?? undefined;
+          const stream = await resolveProphecyPlayback(context, episode, {
+            server: selectedServer,
+            language: (url.searchParams.get('language') as ContentLanguage | null) ?? undefined,
+            audioLanguage: url.searchParams.get('audioLanguage') ?? url.searchParams.get('audio') ?? undefined,
+            subtitle: url.searchParams.get('subtitle') ?? undefined,
+            quality: (url.searchParams.get('quality') as IVideoPayload['quality'] | null) ?? undefined,
+          });
+          return ok({
+            episodeId,
+            server: selectedServer ? publicServerOptions(context, episodeId).find((server) => server.serverId === selectedServer) ?? null : null,
+            availableServers: publicServerOptions(context, episodeId),
+            audioLanguage: selectedAudio,
+            availableAudioLanguages: store.listAudioLanguages(episodeId, true),
+            stream,
+          }), true;
+        } catch (e) {
+          if (e instanceof ProphecyError) return fail(e.message, e.status, e.code), true;
+          throw e;
+        }
       }
     }
 
@@ -688,4 +710,4 @@ export async function handleProphecyRoute(
     fail(message, status);
     return true;
   }
-}
+  }
