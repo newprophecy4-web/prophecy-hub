@@ -258,7 +258,10 @@ export class ProphecyStore {
   updateSeason(seasonId: string, patch: Partial<ProphecySeason>): ProphecySeason { const current = this.require(this.seasons, seasonId, 'Season not found'); const updated = { ...current, ...patch, seasonId, animeId: current.animeId }; this.seasons.set(seasonId, updated); return clone(updated); }
   deleteSeason(seasonId: string): void { this.require(this.seasons, seasonId, 'Season not found'); for (const episode of [...this.episodes.values()]) if (episode.seasonId === seasonId) this.deleteEpisode(episode.episodeId); this.seasons.delete(seasonId); }
 
-  listEpisodes(seasonId: string): ProphecyEpisode[] { return [...this.episodes.values()].filter((x) => x.seasonId === seasonId).sort((a, b) => a.displayOrder - b.displayOrder).map(clone); }
+  listEpisodes(seasonId: string): ProphecyEpisode[] {
+    this.require(this.seasons, seasonId, 'Season not found');
+    return [...this.episodes.values()].filter((x) => x.seasonId === seasonId).sort((a, b) => a.displayOrder - b.displayOrder).map(clone);
+  }
   getEpisode(episodeId: string): ProphecyEpisode | undefined { return clone(this.episodes.get(episodeId)); }
   createEpisode(seasonId: string, input: Partial<ProphecyEpisode> & Pick<ProphecyEpisode, 'title' | 'episodeNumber'>): ProphecyEpisode {
     const season = this.require(this.seasons, seasonId, 'Season not found');
@@ -518,6 +521,16 @@ export async function handleProphecyRoute(
     if (parts[1] === 'servers' && parts.length === 2 && method === 'GET') {
       return ok(publicServerOptions(context)), true;
     }
+    // Explicitly handle the episode-list route before any generic resource branch.
+    // This prevents `/api/seasons/:seasonId/episodes` from ever being interpreted
+    // as a server-list route in a deployed build.
+    if (parts[1] === 'seasons' && parts.length === 4 && parts[3] === 'episodes' && method === 'GET') {
+      const seasonId = parts[2];
+      const season = store.getSeason(seasonId);
+      if (!season) return fail('Season not found', 404, 'SEASON_NOT_FOUND'), true;
+      const episodes = store.listEpisodes(seasonId).map(toProphecyEpisodeIdentity);
+      return ok(episodes, 200, { seasonId, count: episodes.length }), true;
+    }
     if (parts[1] === 'anime' && parts.length >= 3) {
       if (parts[2] === 'search') return false;
       const animeId = parts[2];
@@ -581,8 +594,8 @@ export async function handleProphecyRoute(
     if (parts[1] === 'episodes') {
       const episodeId = parts[2];
       const episode = store.getEpisode(episodeId);
-      if (!episode) return fail('Episode not found'), true;
-      if (parts.length === 3 && method === 'GET') return ok(episode), true;
+      if (!episode) return fail('Episode not found', 404, 'EPISODE_NOT_FOUND'), true;
+      if (parts.length === 3 && method === 'GET') return ok({ ...episode, id: episode.episodeId }), true;
       if (parts.length === 3 && method === 'PATCH') { if (!admin()) return true; return ok(store.updateEpisode(episodeId, await body())), true; }
       if (parts.length === 3 && method === 'DELETE') { if (!admin()) return true; store.deleteEpisode(episodeId); return ok({ deleted: true }), true; }
       const child = parts[3];
