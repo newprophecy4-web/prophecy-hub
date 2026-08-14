@@ -64,12 +64,14 @@ export interface ProphecyEpisode {
   displayOrder: number;
 }
 
+export type ProphecyLanguageType = 'audio' | 'subtitle' | 'both';
+
 export interface ProphecyLanguage {
   languageId: string;
   episodeId: string;
   languageCode: string;
   languageName: string;
-  audioType: 'sub' | 'dub' | 'raw' | 'mixed';
+  type: ProphecyLanguageType;
   isDefault: boolean;
   enabled: boolean;
   priority: number;
@@ -121,7 +123,10 @@ export interface ProphecyProviderState {
 }
 
 export interface ProphecyPlaybackRequest {
-  language?: string;
+  /** Existing provider mode: sub, dub or raw. */
+  language?: ContentLanguage;
+  /** Episode languageId or languageCode selected for audio. */
+  audioLanguage?: string;
   audio?: string;
   subtitle?: string;
   quality?: IVideoPayload['quality'];
@@ -155,6 +160,7 @@ function id(prefix: string): string {
 }
 
 function clone<T>(value: T): T {
+  if (value === undefined) return value;
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
@@ -224,10 +230,62 @@ export class ProphecyStore {
   moveEpisode(episodeId: string, seasonId: string): ProphecyEpisode { const episode = this.require(this.episodes, episodeId, 'Episode not found'); const season = this.require(this.seasons, seasonId, 'Season not found'); return this.updateEpisode(episodeId, { seasonId, animeId: season.animeId }); }
   deleteEpisode(episodeId: string): void { this.require(this.episodes, episodeId, 'Episode not found'); for (const item of [...this.languages.values()]) if (item.episodeId === episodeId) this.languages.delete(item.languageId); for (const item of [...this.audio.values()]) if (item.episodeId === episodeId) this.audio.delete(item.audioId); for (const item of [...this.subtitles.values()]) if (item.episodeId === episodeId) this.subtitles.delete(item.subtitleId); for (const item of [...this.sources.values()]) if (item.episodeId === episodeId) this.sources.delete(item.sourceId); this.episodes.delete(episodeId); }
 
-  listLanguages(episodeId: string): ProphecyLanguage[] { return [...this.languages.values()].filter((x) => x.episodeId === episodeId).sort((a, b) => a.priority - b.priority).map(clone); }
-  createLanguage(episodeId: string, input: Omit<ProphecyLanguage, 'languageId' | 'episodeId'>): ProphecyLanguage { this.require(this.episodes, episodeId, 'Episode not found'); const value = { ...input, languageId: id('language'), episodeId }; this.languages.set(value.languageId, value); return clone(value); }
-  updateLanguage(languageId: string, patch: Partial<ProphecyLanguage>): ProphecyLanguage { const current = this.require(this.languages, languageId, 'Language not found'); const updated = { ...current, ...patch, languageId, episodeId: current.episodeId }; this.languages.set(languageId, updated); return clone(updated); }
-  deleteLanguage(languageId: string): void { this.languages.delete(languageId); }
+  listLanguages(episodeId: string, enabledOnly = false): ProphecyLanguage[] {
+    this.require(this.episodes, episodeId, 'Episode not found');
+    return [...this.languages.values()]
+      .filter((item) => item.episodeId === episodeId && (!enabledOnly || item.enabled))
+      .sort((a, b) => a.priority - b.priority)
+      .map(clone);
+  }
+  listAudioLanguages(episodeId: string, enabledOnly = true): ProphecyLanguage[] {
+    return this.listLanguages(episodeId, enabledOnly).filter((item) => item.type === 'audio' || item.type === 'both');
+  }
+  selectAudioLanguage(episodeId: string, requested?: string): ProphecyLanguage {
+    const available = this.listAudioLanguages(episodeId, true);
+    const selected = requested
+      ? available.find((item) => item.languageId === requested || item.languageCode.toLowerCase() === requested.toLowerCase())
+      : available.find((item) => item.isDefault) ?? available[0];
+    if (!selected) throw new ProphecyError(400, 'AUDIO_LANGUAGE_UNAVAILABLE', 'Requested audio language is not enabled for this episode');
+    return clone(selected);
+  }
+  getLanguage(languageId: string): ProphecyLanguage | undefined { return clone(this.languages.get(languageId)); }
+  createLanguage(episodeId: string, input: Omit<ProphecyLanguage, 'languageId' | 'episodeId'>): ProphecyLanguage {
+    this.require(this.episodes, episodeId, 'Episode not found');
+    validateLanguageInput(input);
+    const duplicate = [...this.languages.values()].some(
+      (item) => item.episodeId === episodeId && item.languageCode === input.languageCode && item.type === input.type,
+    );
+    if (duplicate) throw new ProphecyError(409, 'DUPLICATE_LANGUAGE', 'This language already exists for the episode and type');
+    const value: ProphecyLanguage = { ...input, languageId: id('language'), episodeId };
+    if (value.isDefault) this.unsetOverlappingDefaults(value);
+    this.languages.set(value.languageId, value);
+    return clone(value);
+  }
+  updateLanguage(languageId: string, patch: Partial<ProphecyLanguage>): ProphecyLanguage {
+    const current = this.require(this.languages, languageId, 'Language not found');
+    if ('episodeId' in patch) throw new ProphecyError(400, 'EPISODE_ID_IMMUTABLE', 'episodeId cannot be changed');
+    const allowed: Array<keyof ProphecyLanguage> = ['languageCode', 'languageName', 'type', 'isDefault', 'enabled', 'priority'];
+    if (Object.keys(patch).some((key) => !allowed.includes(key as keyof ProphecyLanguage))) {
+      throw new ProphecyError(400, 'INVALID_LANGUAGE_FIELD', 'Only languageCode, languageName, type, isDefault, enabled and priority can be updated');
+    }
+    validateLanguageInput({ ...current, ...patch });
+    const next = { ...current, ...patch, languageId, episodeId: current.episodeId };
+    const duplicate = [...this.languages.values()].some(
+      (item) => item.languageId !== languageId && item.episodeId === current.episodeId && item.languageCode === next.languageCode && item.type === next.type,
+    );
+    if (duplicate) throw new ProphecyError(409, 'DUPLICATE_LANGUAGE', 'This language already exists for the episode and type');
+    if (next.isDefault) this.unsetOverlappingDefaults(next, languageId);
+    this.languages.set(languageId, next);
+    return clone(next);
+  }
+  deleteLanguage(languageId: string): void { this.require(this.languages, languageId, 'Language not found'); this.languages.delete(languageId); }
+  private unsetOverlappingDefaults(language: ProphecyLanguage, exceptId?: string): void {
+    for (const [itemId, item] of this.languages) {
+      if (itemId !== exceptId && item.episodeId === language.episodeId && languageTypesOverlap(item.type, language.type) && item.isDefault) {
+        this.languages.set(itemId, { ...item, isDefault: false });
+      }
+    }
+  }
 
   listAudio(episodeId: string): ProphecyAudio[] { return [...this.audio.values()].filter((x) => x.episodeId === episodeId).map(clone); }
   createAudio(episodeId: string, input: Omit<ProphecyAudio, 'audioId' | 'episodeId'>): ProphecyAudio { this.require(this.episodes, episodeId, 'Episode not found'); const value = { ...input, audioId: id('audio'), episodeId }; this.audio.set(value.audioId, value); return clone(value); }
@@ -250,6 +308,35 @@ export class ProphecyStore {
   private require<T>(map: Map<string, T>, key: string, message: string): T { const value = map.get(key); if (!value) throw new Error(message); return value; }
 }
 
+export class ProphecyError extends Error {
+  constructor(public readonly status: number, public readonly code: string, message: string) {
+    super(message);
+    this.name = 'ProphecyError';
+  }
+}
+
+function languageTypesOverlap(a: ProphecyLanguageType, b: ProphecyLanguageType): boolean {
+  return a === b || a === 'both' || b === 'both';
+}
+
+function validateLanguageInput(input: Partial<ProphecyLanguage>): void {
+  if (typeof input.languageCode !== 'string' || !/^[A-Za-z0-9_-]{1,32}$/.test(input.languageCode.trim())) {
+    throw new ProphecyError(400, 'INVALID_LANGUAGE_CODE', 'languageCode must be 1-32 characters using letters, numbers, _ or -');
+  }
+  if (typeof input.languageName !== 'string' || input.languageName.trim() === '') {
+    throw new ProphecyError(400, 'INVALID_LANGUAGE_NAME', 'languageName is required');
+  }
+  if (input.type !== 'audio' && input.type !== 'subtitle' && input.type !== 'both') {
+    throw new ProphecyError(400, 'INVALID_LANGUAGE_TYPE', 'type must be audio, subtitle or both');
+  }
+  if (typeof input.priority !== 'number' || !Number.isInteger(input.priority) || input.priority < 0) {
+    throw new ProphecyError(400, 'INVALID_LANGUAGE_PRIORITY', 'priority must be a non-negative integer');
+  }
+  if (typeof input.isDefault !== 'boolean' || typeof input.enabled !== 'boolean') {
+    throw new ProphecyError(400, 'INVALID_LANGUAGE_BOOLEAN', 'isDefault and enabled must be booleans');
+  }
+}
+
 export function checkAdminToken(req: IncomingMessage, expected?: string): boolean {
   if (!expected) return false;
   const header = req.headers.authorization ?? '';
@@ -264,7 +351,14 @@ export async function resolveProphecyPlayback(
   episode: ProphecyEpisode,
   request: ProphecyPlaybackRequest,
 ): Promise<ResolvedMediaStream> {
-  const candidates = context.store.listSources(episode.episodeId, request.language).filter((source) => !request.quality || source.quality === request.quality || source.quality === 'auto');
+  const requestedAudio = request.audioLanguage ?? request.audio;
+  const selectedAudio = context.store.selectAudioLanguage(episode.episodeId, requestedAudio);
+  const preferredSourceLanguage = requestedAudio ? selectedAudio.languageCode : request.language;
+  const primaryCandidates = context.store.listSources(episode.episodeId, preferredSourceLanguage);
+  const fallbackCandidates = !requestedAudio && primaryCandidates.length === 0
+    ? context.store.listSources(episode.episodeId, selectedAudio.languageCode)
+    : [];
+  const candidates = [...primaryCandidates, ...fallbackCandidates].filter((source) => !request.quality || source.quality === request.quality || source.quality === 'auto');
   const providerStates = new Map(context.store.listProviders().map((item) => [item.providerId, item]));
   candidates.sort((a, b) => (providerStates.get(a.providerId)?.priority ?? 100) - (providerStates.get(b.providerId)?.priority ?? 100) || a.priority - b.priority);
   for (const source of candidates) {
@@ -272,8 +366,8 @@ export async function resolveProphecyPlayback(
     if (!provider || providerStates.get(source.providerId)?.enabled === false) continue;
     try {
       const stream = source.reference
-        ? await provider.resolveStream(source.reference, (request.language === 'sub' || request.language === 'dub' || request.language === 'raw' ? request.language : undefined))
-        : await provider.resolveStream(episode.episodeId, (request.language === 'sub' || request.language === 'dub' || request.language === 'raw' ? request.language : undefined));
+        ? await provider.resolveStream(source.reference, request.language)
+        : await provider.resolveStream(episode.episodeId, request.language);
       if (stream.type === 'video' && stream.streams.length > 0) return context.proxyify ? context.proxyify(stream) : stream;
     } catch {
       context.store.setProvider(source.providerId, { health: 'degraded' });
@@ -295,8 +389,8 @@ export async function readJsonBody(req: IncomingMessage): Promise<Record<string,
   return value as Record<string, unknown>;
 }
 
-export function prophecyResponse(res: ServerResponse, status: number, data: unknown, error: unknown = null, meta: Record<string, unknown> = {}): void {
-  const body = JSON.stringify({ success: status < 400, data: status < 400 ? data : null, error: status < 400 ? null : { code: 'PROPHECY_ERROR', message: error instanceof Error ? error.message : String(error) }, meta });
+export function prophecyResponse(res: ServerResponse, status: number, data: unknown, error: unknown = null, meta: Record<string, unknown> = {}, errorCode = 'PROPHECY_ERROR'): void {
+  const body = JSON.stringify({ success: status < 400, data: status < 400 ? data : null, error: status < 400 ? null : { code: errorCode, message: error instanceof Error ? error.message : String(error) }, meta });
   res.writeHead(status, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS', 'Content-Length': Buffer.byteLength(body) });
   res.end(body);
 }
@@ -324,7 +418,7 @@ export async function handleProphecyRoute(
   };
   const body = async () => readJsonBody(req);
   const ok = (data: unknown, status = 200) => prophecyResponse(res, status, data);
-  const fail = (error: unknown, status = 404) => prophecyResponse(res, status, null, error);
+  const fail = (error: unknown, status = 404, code = 'PROPHECY_ERROR') => prophecyResponse(res, status, null, error, {}, code);
 
   try {
     if (parts[1] === 'anime' && parts.length >= 3) {
@@ -384,9 +478,24 @@ export async function handleProphecyRoute(
       if (parts.length === 3 && method === 'PATCH') { if (!admin()) return true; return ok(store.updateEpisode(episodeId, await body())), true; }
       if (parts.length === 3 && method === 'DELETE') { if (!admin()) return true; store.deleteEpisode(episodeId); return ok({ deleted: true }), true; }
       const child = parts[3];
+      if (child === 'audio-languages') {
+        if (parts.length === 4 && method === 'GET') return ok(store.listAudioLanguages(episodeId, url.searchParams.get('enabledOnly') !== 'false')), true;
+      }
       if (child === 'languages') {
-        if (parts.length === 4 && method === 'GET') return ok(store.listLanguages(episodeId)), true;
-        if (parts.length === 4 && method === 'POST') { if (!admin()) return true; return ok(store.createLanguage(episodeId, await body() as Omit<ProphecyLanguage, 'languageId' | 'episodeId'>), 201), true; }
+        if (parts.length === 4 && method === 'GET') return ok(store.listLanguages(episodeId, url.searchParams.get('enabledOnly') === 'true')), true;
+        if (parts.length === 4 && method === 'POST') {
+          if (!admin()) return true;
+          const input = await body();
+          const value = {
+            languageCode: input.languageCode,
+            languageName: input.languageName,
+            type: input.type,
+            isDefault: input.isDefault,
+            enabled: input.enabled,
+            priority: input.priority,
+          } as Omit<ProphecyLanguage, 'languageId' | 'episodeId'>;
+          return ok(store.createLanguage(episodeId, value), 201), true;
+        }
       }
       if (child === 'audio') {
         if (parts.length === 4 && method === 'GET') return ok(store.listAudio(episodeId)), true;
@@ -401,18 +510,25 @@ export async function handleProphecyRoute(
         if (parts.length === 4 && method === 'POST') { if (!admin()) return true; return ok(store.createSource(episodeId, await body() as Omit<ProphecySource, 'sourceId' | 'episodeId'>), 201), true; }
       }
       if (child === 'play' && method === 'GET') {
+        const selectedAudio = store.selectAudioLanguage(episodeId, url.searchParams.get('audioLanguage') ?? url.searchParams.get('audio') ?? undefined);
         const stream = await resolveProphecyPlayback(context, episode, {
-          language: url.searchParams.get('language') ?? undefined,
-          audio: url.searchParams.get('audio') ?? undefined,
+          language: (url.searchParams.get('language') as ContentLanguage | null) ?? undefined,
+          audioLanguage: url.searchParams.get('audioLanguage') ?? url.searchParams.get('audio') ?? undefined,
           subtitle: url.searchParams.get('subtitle') ?? undefined,
           quality: (url.searchParams.get('quality') as IVideoPayload['quality'] | null) ?? undefined,
         });
-        return ok({ episodeId, stream, audio: store.listAudio(episodeId), subtitles: store.listSubtitles(episodeId) }), true;
+        return ok({
+          episodeId,
+          audioLanguage: selectedAudio,
+          availableAudioLanguages: store.listAudioLanguages(episodeId, true),
+          stream,
+        }), true;
       }
     }
 
     if (parts[1] === 'languages' && parts.length === 3) {
       const languageId = parts[2];
+      if (method === 'GET') { const value = store.getLanguage(languageId); return value ? (ok(value), true) : (fail('Language not found', 404, 'LANGUAGE_NOT_FOUND'), true); }
       if (method === 'PATCH') { if (!admin()) return true; return ok(store.updateLanguage(languageId, await body())), true; }
       if (method === 'DELETE') { if (!admin()) return true; store.deleteLanguage(languageId); return ok({ deleted: true }), true; }
     }
@@ -434,8 +550,12 @@ export async function handleProphecyRoute(
     return false;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    if (error instanceof ProphecyError) {
+      fail(message, error.status, error.code);
+      return true;
+    }
     const status = /not found/i.test(message) ? 404 : /required|JSON|must be/i.test(message) ? 400 : 500;
     fail(message, status);
     return true;
   }
-}
+                     }
