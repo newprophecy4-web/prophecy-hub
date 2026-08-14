@@ -1,6 +1,7 @@
 import {
   HttpClient,
   startServer,
+  AnilistMeta,
   GogoanimeProvider,
   GoyabuProvider,
   AllmangaProvider,
@@ -33,7 +34,13 @@ startServer({
     new WeebcentralProvider(http),
     new MangapillProvider(http),
   ],
+  metaProviders: [new AnilistMeta(http)],
   port: Number(process.env.PORT ?? 3030),
   proxy: true,
+  proxySignSecret: process.env.PROXY_SECRET,
+  proxyAllowedHosts: (process.env.PROXY_ALLOWED_HOSTS ?? '')
+    .split(',')
+    .map((host) => host.trim())
+    .filter(Boolean),
   cache,
 });
