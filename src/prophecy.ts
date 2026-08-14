@@ -558,4 +558,4 @@ export async function handleProphecyRoute(
     fail(message, status);
     return true;
   }
-                     }
+}
