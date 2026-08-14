@@ -56,6 +56,8 @@ export interface ProphecyEpisode {
   episodeNumber: number;
   absoluteEpisodeNumber?: number;
   title: string;
+  /** Provider-native episode identifier, when a provider mapping exists. */
+  providerEpisodeId?: string;
   description?: string;
   thumbnail?: string;
   duration?: number;
@@ -122,7 +124,17 @@ export interface ProphecyProviderState {
   updatedAt: string;
 }
 
+export interface ProphecyServerAlias {
+  serverId: string;
+  label: string;
+  providerId: string;
+  priority: number;
+  enabled: boolean;
+}
+
 export interface ProphecyPlaybackRequest {
+  /** User-facing alias such as server-1; never expose providerId to the client. */
+  server?: string;
   /** Existing provider mode: sub, dub or raw. */
   language?: ContentLanguage;
   /** Episode languageId or languageCode selected for audio. */
@@ -135,6 +147,8 @@ export interface ProphecyPlaybackRequest {
 export interface ProphecyApiOptions {
   store: ProphecyStore;
   adminToken?: string;
+  /** Internal provider mapping; public responses expose only Server N labels. */
+  serverAliases?: ProphecyServerAlias[];
 }
 
 export interface ProphecyApiContext extends ProphecyApiOptions {
@@ -204,8 +218,34 @@ export class ProphecyStore {
     this.anime.delete(animeId);
   }
 
+  resolveAnimeId(reference: string): string | undefined {
+    if (this.anime.has(reference)) return reference;
+    const match = /^(anilist|mal):(.+)$/.exec(reference);
+    return [...this.anime.values()].find((item) => {
+      if (match?.[1] === 'anilist' && String(item.anilistId ?? '') === match[2]) return true;
+      if (match?.[1] === 'mal' && String(item.malId ?? '') === match[2]) return true;
+      const mappings = item.externalMappings ?? {};
+      return Object.entries(mappings).some(([key, value]) =>
+        (key.toLowerCase() === 'anilist' || key.toLowerCase() === 'anilistid') && match?.[1] === 'anilist' && String(value) === match[2]
+        || (key.toLowerCase() === 'mal' || key.toLowerCase() === 'malid') && match?.[1] === 'mal' && String(value) === match[2],
+      );
+    })?.prophecyAnimeId;
+  }
   listSeasons(animeId: string): ProphecySeason[] {
     return [...this.seasons.values()].filter((x) => x.animeId === animeId).sort((a, b) => a.displayOrder - b.displayOrder).map(clone);
+  }
+  listSeasonsByReference(reference: string): ProphecySeason[] {
+    const animeId = this.resolveAnimeId(reference);
+    return animeId ? this.listSeasons(animeId) : [];
+  }
+  listEpisodesByAnime(animeReference: string): ProphecyEpisode[] {
+    const animeId = this.resolveAnimeId(animeReference);
+    if (!animeId) return [];
+    const seasonOrder = new Map(this.listSeasons(animeId).map((season, index) => [season.seasonId, index]));
+    return [...this.episodes.values()]
+      .filter((episode) => episode.animeId === animeId)
+      .sort((a, b) => (seasonOrder.get(a.seasonId) ?? 0) - (seasonOrder.get(b.seasonId) ?? 0) || a.displayOrder - b.displayOrder || a.episodeNumber - b.episodeNumber)
+      .map(clone);
   }
   getSeason(seasonId: string): ProphecySeason | undefined { return clone(this.seasons.get(seasonId)); }
   createSeason(animeId: string, input: Partial<ProphecySeason> = {}): ProphecySeason {
@@ -353,10 +393,14 @@ export async function resolveProphecyPlayback(
 ): Promise<ResolvedMediaStream> {
   const requestedAudio = request.audioLanguage ?? request.audio;
   const selectedAudio = context.store.selectAudioLanguage(episode.episodeId, requestedAudio);
+  const selectedServer = request.server ? context.serverAliases?.find((server) => server.serverId === request.server && server.enabled) : undefined;
+  if (request.server && !selectedServer) throw new ProphecyError(400, 'SERVER_UNAVAILABLE', 'Requested server is not available for this request');
   const preferredSourceLanguage = requestedAudio ? selectedAudio.languageCode : request.language;
-  const primaryCandidates = context.store.listSources(episode.episodeId, preferredSourceLanguage);
+  const primaryCandidates = context.store.listSources(episode.episodeId, preferredSourceLanguage)
+    .filter((source) => !selectedServer || source.providerId === selectedServer.providerId);
   const fallbackCandidates = !requestedAudio && primaryCandidates.length === 0
     ? context.store.listSources(episode.episodeId, selectedAudio.languageCode)
+      .filter((source) => !selectedServer || source.providerId === selectedServer.providerId)
     : [];
   const candidates = [...primaryCandidates, ...fallbackCandidates].filter((source) => !request.quality || source.quality === request.quality || source.quality === 'auto');
   const providerStates = new Map(context.store.listProviders().map((item) => [item.providerId, item]));
@@ -397,6 +441,53 @@ export function prophecyResponse(res: ServerResponse, status: number, data: unkn
 
 export type { ContentLanguage, IContentUnit, ISubtitleTrack };
 
+export interface ProphecyEpisodeIdentity {
+  /** Canonical internal Prophecy episode ID. Use this value for all /api/episodes/:episodeId routes. */
+  id: string;
+  animeId: string;
+  seasonId: string;
+  episodeNumber: number;
+  title: string;
+  /** Provider-native episode ID, when configured; never the canonical id. */
+  providerId: string | null;
+  /** Backward-compatible alias; id remains canonical. */
+  episodeId: string;
+}
+
+export function toProphecyEpisodeIdentity(episode: ProphecyEpisode): ProphecyEpisodeIdentity {
+  return {
+    id: episode.episodeId,
+    animeId: episode.animeId,
+    seasonId: episode.seasonId,
+    episodeNumber: episode.episodeNumber,
+    title: episode.title,
+    providerId: episode.providerEpisodeId ?? null,
+    episodeId: episode.episodeId,
+  };
+}
+
+const PUBLIC_ANIME_PROVIDER_IDS = new Set(['gogoanime', 'goyabu', 'allmanga', 'animeparadise', 'anikoto', 'megaplay']);
+
+type PublicServerOption = Omit<ProphecyServerAlias, 'providerId'> & { available?: boolean };
+
+function publicServerOptions(context: ProphecyApiContext, episodeId?: string): PublicServerOption[] {
+  return (context.serverAliases ?? context.providers
+    .filter((provider) => PUBLIC_ANIME_PROVIDER_IDS.has(provider.id))
+    .map((provider, index) => ({
+      serverId: `server-${index + 1}`,
+      label: `Server ${index + 1}`,
+      providerId: provider.id,
+      priority: index + 1,
+      enabled: true,
+    })))
+    .filter((server) => server.enabled)
+    .sort((a, b) => a.priority - b.priority)
+    .map(({ providerId, ...server }) => ({
+      ...server,
+      ...(episodeId ? { available: context.store.listSources(episodeId).some((source) => source.providerId === providerId && source.enabled) } : {}),
+    }));
+}
+
 export async function handleProphecyRoute(
   context: ProphecyApiContext,
   req: IncomingMessage,
@@ -417,10 +508,16 @@ export async function handleProphecyRoute(
     return true;
   };
   const body = async () => readJsonBody(req);
-  const ok = (data: unknown, status = 200) => prophecyResponse(res, status, data);
+  const ok = (data: unknown, status = 200, meta: Record<string, unknown> = {}) => prophecyResponse(res, status, data, null, meta);
   const fail = (error: unknown, status = 404, code = 'PROPHECY_ERROR') => prophecyResponse(res, status, null, error, {}, code);
 
   try {
+    if (parts[1] === 'providers' && parts.length === 2 && method === 'GET') {
+      return ok(publicServerOptions(context)), true;
+    }
+    if (parts[1] === 'servers' && parts.length === 2 && method === 'GET') {
+      return ok(publicServerOptions(context)), true;
+    }
     if (parts[1] === 'anime' && parts.length >= 3) {
       if (parts[2] === 'search') return false;
       const animeId = parts[2];
@@ -438,11 +535,22 @@ export async function handleProphecyRoute(
         store.deleteAnime(animeId);
         return ok({ deleted: true }), true;
       }
+      if (parts[3] === 'episodes' && parts.length === 4 && method === 'GET') {
+        const resolvedAnimeId = store.resolveAnimeId(animeId);
+        if (!resolvedAnimeId) return fail('Anime not found', 404, 'ANIME_NOT_FOUND'), true;
+        const episodes = store.listEpisodesByAnime(animeId).map(toProphecyEpisodeIdentity);
+        return ok(episodes, 200, { animeId, resolvedAnimeId, count: episodes.length }), true;
+      }
       if (parts[3] === 'seasons') {
-        if (parts.length === 4 && method === 'GET') return ok(store.listSeasons(animeId)), true;
+        if (parts.length === 4 && method === 'GET') {
+          const resolvedAnimeId = store.resolveAnimeId(animeId);
+          return resolvedAnimeId ? (ok(store.listSeasons(resolvedAnimeId)), true) : (fail('Anime not found', 404, 'ANIME_NOT_FOUND'), true);
+        }
         if (parts.length === 4 && method === 'POST') {
           if (!admin()) return true;
-          return ok(store.createSeason(animeId, await body()), 201), true;
+          const resolvedAnimeId = store.resolveAnimeId(animeId);
+          if (!resolvedAnimeId) return fail('Anime not found', 404, 'ANIME_NOT_FOUND'), true;
+          return ok(store.createSeason(resolvedAnimeId, await body()), 201), true;
         }
       }
     }
@@ -460,7 +568,7 @@ export async function handleProphecyRoute(
       if (parts.length === 3 && method === 'PATCH') { if (!admin()) return true; return ok(store.updateSeason(seasonId, await body())), true; }
       if (parts.length === 3 && method === 'DELETE') { if (!admin()) return true; store.deleteSeason(seasonId); return ok({ deleted: true }), true; }
       if (parts[3] === 'episodes') {
-        if (parts.length === 4 && method === 'GET') return ok(store.listEpisodes(seasonId)), true;
+        if (parts.length === 4 && method === 'GET') return ok(store.listEpisodes(seasonId).map(toProphecyEpisodeIdentity)), true;
         if (parts.length === 4 && method === 'POST') {
           if (!admin()) return true;
           const input = await body();
@@ -480,6 +588,11 @@ export async function handleProphecyRoute(
       const child = parts[3];
       if (child === 'audio-languages') {
         if (parts.length === 4 && method === 'GET') return ok(store.listAudioLanguages(episodeId, url.searchParams.get('enabledOnly') !== 'false')), true;
+      }
+      if (child === 'servers') {
+        if (parts.length === 4 && method === 'GET') {
+          return ok(publicServerOptions(context, episodeId)), true;
+        }
       }
       if (child === 'languages') {
         if (parts.length === 4 && method === 'GET') return ok(store.listLanguages(episodeId, url.searchParams.get('enabledOnly') === 'true')), true;
@@ -511,7 +624,9 @@ export async function handleProphecyRoute(
       }
       if (child === 'play' && method === 'GET') {
         const selectedAudio = store.selectAudioLanguage(episodeId, url.searchParams.get('audioLanguage') ?? url.searchParams.get('audio') ?? undefined);
+        const selectedServer = url.searchParams.get('server') ?? undefined;
         const stream = await resolveProphecyPlayback(context, episode, {
+          server: selectedServer,
           language: (url.searchParams.get('language') as ContentLanguage | null) ?? undefined,
           audioLanguage: url.searchParams.get('audioLanguage') ?? url.searchParams.get('audio') ?? undefined,
           subtitle: url.searchParams.get('subtitle') ?? undefined,
@@ -519,6 +634,8 @@ export async function handleProphecyRoute(
         });
         return ok({
           episodeId,
+          server: selectedServer ? publicServerOptions(context, episodeId).find((server) => server.serverId === selectedServer) ?? null : null,
+          availableServers: publicServerOptions(context, episodeId),
           audioLanguage: selectedAudio,
           availableAudioLanguages: store.listAudioLanguages(episodeId, true),
           stream,
