@@ -41,5 +41,8 @@ export * from './meta/index.js';
 // Download
 export * from './download/index.js';
 
+// Prophecy management/playback adapter
+export * from './prophecy.js';
+
 // HTTP server
 export * from './server/index.js';
