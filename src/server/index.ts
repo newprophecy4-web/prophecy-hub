@@ -529,10 +529,83 @@ export function startServer(options: ServerOptions): http.Server {
         return;
       }
 
+      // ── Prophecy Verse adapter routes ─────────────────────────────────
+      // These aliases reuse the existing metadata/provider/proxy pipeline.
+      // The generic routes below remain unchanged for backwards compatibility.
+      if (url.pathname === '/api/providers') {
+        return json(
+          res,
+          200,
+          providers.map((provider) => ({
+            id: provider.id,
+            name: (provider as BaseProvider & { name?: string }).name ?? provider.id,
+            supportedTypes: provider.supportedTypes,
+            supportsTracks: provider.supportsUnitTracks,
+          })),
+        );
+      }
+
+      if (url.pathname.startsWith('/api/anime/')) {
+        const segments = url.pathname
+          .slice('/api/anime/'.length)
+          .split('/')
+          .filter(Boolean)
+          .map((segment) => decodeURIComponent(segment));
+        const meta = findMetaProvider(q.get('metaProvider')) ?? metaProviders[0] ?? null;
+        const contentProvider = findProvider(q.get('provider')) ?? providers[0] ?? null;
+        if (!meta) return err(res, 503, 'No metadata provider is configured');
+        if (segments[0] === 'search') {
+          const query = q.get('q');
+          if (!query) return err(res, 400, 'Missing param: q');
+          const items = await cached(`prophecy:search:${meta.id}:${query}`, () => meta.search(query));
+          return json(res, 200, items);
+        }
+        if (!segments[0]) return err(res, 400, 'Missing anime id');
+
+        const metaUrn = segments[0];
+        if (segments.length === 1) {
+          const info = await cached(`prophecy:info:${meta.id}:${metaUrn}`, () =>
+            meta.fetchMediaInfo(metaUrn),
+          );
+          return json(res, 200, info);
+        }
+        if (segments[1] !== 'episodes') return err(res, 404, 'Not found');
+        if (!contentProvider) return err(res, 503, 'No content provider is configured');
+
+        if (segments.length === 2) {
+          const units = await cached(
+            `prophecy:episodes:${meta.id}:${metaUrn}:${contentProvider.id}`,
+            () => meta.fetchContentUnits(metaUrn, contentProvider),
+          );
+          return json(res, 200, units);
+        }
+        const episodeNumber = Number(segments[2]);
+        if (!Number.isFinite(episodeNumber)) return err(res, 400, 'Episode must be numeric');
+        const language = q.get('language') as ContentLanguage | null;
+        const operation = segments[3];
+        if (operation !== 'stream' && operation !== 'tracks') return err(res, 404, 'Not found');
+        if (operation === 'tracks' && !contentProvider.supportsUnitTracks) {
+          return err(res, 501, `Provider "${contentProvider.id}" does not expose track metadata`);
+        }
+        if (operation === 'tracks') {
+          const tracks = await cached(
+            `prophecy:tracks:${meta.id}:${metaUrn}:${contentProvider.id}:${episodeNumber}:${language ?? ''}`,
+            () => meta.fetchUnitTracks(metaUrn, episodeNumber, contentProvider, language ?? undefined),
+          );
+          return json(res, 200, { provider: contentProvider.id, ...tracks });
+        }
+        let stream = await cached(
+          `prophecy:stream:${meta.id}:${metaUrn}:${contentProvider.id}:${episodeNumber}:${language ?? ''}`,
+          () => meta.resolveStream(metaUrn, episodeNumber, contentProvider, language ?? undefined),
+        );
+        if (proxy) stream = proxyifyStream(stream, proxyBase, proxySignSecret);
+        return json(res, 200, { provider: contentProvider.id, ...stream });
+      }
+
       // ── API ────────────────────────────────────────────────────────────
       // Each handler runs its provider call through the optional `cache`.
       // Keys are namespaced by endpoint + provider so the consumer's cache
-      // can apply different TTLs per kind if it wants to.
+      // can apply different TTLs per kind if it wants.
       if (url.pathname === '/search') {
         const query = q.get('q');
         const provider = findProvider(q.get('provider'));
@@ -1297,4 +1370,4 @@ function buildOpenApiSpec(args: {
     servers: [{ url: args.proxyBase.replace(/\/proxy$/, '') }],
     paths,
   };
-}
+    }
