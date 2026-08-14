@@ -1385,4 +1385,4 @@ function buildOpenApiSpec(args: {
     servers: [{ url: args.proxyBase.replace(/\/proxy$/, '') }],
     paths,
   };
-  }
+}
