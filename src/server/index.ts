@@ -17,6 +17,7 @@ import {
 } from '../types/index.js';
 import { proxifySubtitleUrl } from '../utils/subtitles.js';
 import { strictUnwrapUrn } from '../utils/urn.js';
+import { handleProphecyRoute, type ProphecyApiContext } from '../prophecy.js';
 import {
   downloadVideo,
   downloadMangaPage,
@@ -72,6 +73,8 @@ export interface ServerOptions {
    * the contract and the key namespacing used.
    */
   cache?: SdkCache;
+  /** Optional consolidated Prophecy management/playback layer. */
+  prophecy?: ProphecyApiContext;
 }
 
 const CORS = {
@@ -225,6 +228,7 @@ export function startServer(options: ServerOptions): http.Server {
     proxyBase: configuredProxyBase,
     proxySignSecret,
     proxyAllowedHosts,
+    prophecy,
   } = options;
 
   // Token → completed download, cleaned up after 10 minutes or on serve
@@ -351,6 +355,17 @@ export function startServer(options: ServerOptions): http.Server {
       const header = req.headers['authorization'] ?? '';
       const token = header.startsWith('Bearer ') ? header.slice(7) : '';
       if (token !== auth.token) return err(res, 401, 'Unauthorized');
+    }
+
+    if (prophecy && url.pathname.startsWith('/api/')) {
+      const prophecyContext: ProphecyApiContext = {
+        ...prophecy,
+        proxyify:
+          prophecy.proxyify ??
+          ((stream) => (proxy ? proxyifyStream(stream, proxyBase, proxySignSecret) : stream)),
+      };
+      const handled = await handleProphecyRoute(prophecyContext, req, res, url);
+      if (handled) return;
     }
 
     if (req.method !== 'GET') return err(res, 405, 'Method not allowed');
@@ -1370,4 +1385,4 @@ function buildOpenApiSpec(args: {
     servers: [{ url: args.proxyBase.replace(/\/proxy$/, '') }],
     paths,
   };
-    }
+  }
